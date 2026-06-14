@@ -1,1 +1,165 @@
+name: Tourism Project Pipeline
 
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+
+  register-dataset:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install Dependencies
+        run: pip install -q huggingface_hub pandas
+      - name: Upload Dataset to Hugging Face Hub
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python - <<'PY'
+          from huggingface_hub import HfApi
+
+          api = HfApi(token="${{ secrets.HF_TOKEN }}")
+          repo_id = "arjunmathuram/wellness-tourism-data"
+
+          api.upload_file(
+              path_or_fileobj="wellness-tourism-project/data/train.csv",
+              path_in_repo="processed/train.csv",
+              repo_id=repo_id,
+              repo_type="dataset"
+          )
+
+          api.upload_file(
+              path_or_fileobj="wellness-tourism-project/data/test.csv",
+              path_in_repo="processed/test.csv",
+              repo_id=repo_id,
+              repo_type="dataset"
+          )
+          PY
+
+  data-prep:
+    needs: register-dataset
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install Dependencies
+        run: pip install -q pandas
+      - name: Run Data Preparation
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python - <<'PY'
+          import pandas as pd
+
+          train_df = pd.read_csv("wellness-tourism-project/data/train.csv")
+          test_df = pd.read_csv("wellness-tourism-project/data/test.csv")
+
+          assert "ProdTaken" in train_df.columns
+          assert "ProdTaken" in test_df.columns
+
+          print("Train shape:", train_df.shape)
+          print("Test shape:", test_df.shape)
+          print("Data preparation validation completed.")
+          PY
+
+  model-training:
+    needs: data-prep
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install Dependencies
+        run: pip install -q pandas scikit-learn joblib huggingface_hub mlflow
+      - name: Start MLflow Server
+        run: |
+          nohup mlflow ui --host 0.0.0.0 --port 5000 &
+          sleep 5
+      - name: Model Building
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python - <<'PY'
+          import pandas as pd
+          import joblib
+          from sklearn.compose import ColumnTransformer
+          from sklearn.preprocessing import OneHotEncoder
+          from sklearn.pipeline import Pipeline
+          from sklearn.ensemble import GradientBoostingClassifier
+          from huggingface_hub import HfApi
+
+          train_df = pd.read_csv("wellness-tourism-project/data/train.csv")
+
+          X_train = train_df.drop("ProdTaken", axis=1)
+          y_train = train_df["ProdTaken"]
+
+          categorical_cols = X_train.select_dtypes(include=["object"]).columns.tolist()
+
+          preprocessor = ColumnTransformer(
+              transformers=[
+                  ("categorical", OneHotEncoder(handle_unknown="ignore"), categorical_cols)
+              ],
+              remainder="passthrough"
+          )
+
+          model = Pipeline(
+              steps=[
+                  ("preprocessor", preprocessor),
+                  ("classifier", GradientBoostingClassifier(random_state=42))
+              ]
+          )
+
+          model.fit(X_train, y_train)
+
+          joblib.dump(model, "model.pkl")
+
+          api = HfApi(token="${{ secrets.HF_TOKEN }}")
+          api.upload_file(
+              path_or_fileobj="model.pkl",
+              path_in_repo="model.pkl",
+              repo_id="arjunmathuram/wellness-tourism-model",
+              repo_type="model"
+          )
+
+          print("Model trained and uploaded successfully.")
+          PY
+
+  deploy-hosting:
+    runs-on: ubuntu-latest
+    needs: [model-training, data-prep, register-dataset]
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install Dependencies
+        run: pip install -q huggingface_hub
+      - name: Push files to Frontend Hugging Face Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python - <<'PY'
+          from huggingface_hub import HfApi
+
+          api = HfApi(token="${{ secrets.HF_TOKEN }}")
+          space_id = "arjunmathuram/wellness-tourism-app"
+
+          api.create_repo(
+              repo_id=space_id,
+              repo_type="space",
+              space_sdk="streamlit",
+              exist_ok=True
+          )
+
+          api.upload_file(
+              path_or_fileobj="wellness-tourism-project/app.py",
+              path_in_repo="app.py",
+              repo_id=space_id,
+              repo_type="space"
+          )
+
+          api.upload_file(
+              path_or_fileobj="wellness-tourism-project/requirements.txt",
+              path_in_repo="requirements.txt",
+              repo_id=space_id,
+              repo_type="space"
+          )
+
+          print("Streamlit app pushed to Hugging Face Space.")
+          PY
